@@ -1,0 +1,659 @@
+---
+title: Mark-Recapture Workshop 2024
+subtitle: Bayesian Modeling with Stan using CmdStanR
+author: Dr. Matthijs Hollanders
+format:
+  revealjs:
+    logo: "../logo/Logo-Quantecol-RGB-FA-1-2000.png"
+    smaller: true
+    incremental: true
+    slide-number: true
+    standalone: true
+    embed-resources: true
+bibliography: '`r here::here("R/refs.bib")`'
+execute:
+  echo: true
+---
+
+```{r}
+#| echo: false
+
+# load packages
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(tidyverse, here, cmdstanr)
+
+# load and set theme
+if (file.exists(here("R/my-theme.R"))) {
+  source(here("R/my-theme.R"))
+  theme_set(my_theme(base_size = 20))
+}
+register_knitr_engine(override = T)
+```
+
+## History of Bayesian PPLs
+
+::: columns
+::: {.column width="70%"}
+
+  -   MCMC only became feasible with modern computers
+  -   Bayesian Inference Using Gibbs Sampling (BUGS)
+      - BUGS, WinBUGS, OpenBUGS, MultiBUGS
+  -   JAGS: Just Another Gibbs Sampler
+  -   NIMBLE: 
+  -   Stan [@carpenter2017] (named after Stanisław Ulam)
+      -   State-of-the-art MCMC algorithm: No U-Turn Sampler (NUTS)
+      -   [Gradient-based vs. random walk](https://chi-feng.github.io/mcmc-demo/app.html?algorithm=AdaptiveMH&target=banana)
+      -   World class developer team
+      -   Lots of auxilliary packages for model checking, plotting, goodness-of-fit, etc.
+      
+:::
+::: {.column width="30%"}
+
+![](../img/Stan.png){width="100%"}
+  
+:::
+:::
+
+## Introducing Stan
+
+  -   "Stan is a state-of-the-art platform for statistical modeling and high-performance statistical computation."
+  -   Interfaces with R, Python, etc.
+  -   Specify a **log probability density function** in a Stan **program** and fit models to data
+      -   Logs make everything easier (multiplication becomes addition, etc.)
+      -   Hamiltonian Monte Carlo (No U-Turn Sampler [NUTS])
+      -   Variational inference (approximate Bayesian inference)
+      -   Optimisation (maximum likelihood)
+  -   We will be using CmdStan using **cmdstanr** [@gabry2024] in R
+
+## Stan programs
+
+::: {.columns align=center}
+::: {.column width="50%"}
+
+### Model of the mean
+
+$$
+\begin{aligned}
+  y_i &\sim \mathrm{Normal}(\mu, \sigma), \quad   i \in 1:I \\
+  \mu &\sim p(.) \\
+  \sigma &\sim p(.) \\ 
+\end{aligned}
+$$
+
+We want to know $p(\mu, \sigma \mid y)$
+
+::: fragment
+```{r}
+# generate 100 observations
+I <- 100
+mu <- 3.7
+sigma <- 1.3
+y <- rnorm(I, mu, sigma)
+
+# empirical mean and SD
+mean(y) ; sd(y)
+```
+:::
+
+:::
+::: {.column width="50%" .fragment}
+
+**Static typing**: forces intent and catches errors sooner
+
+```{stan output.var = "mean_mod"}
+functions {
+  // user-defined functions go here
+}
+data {
+  int<lower=0> I;  // number of observations
+  vector[I] y;  // outcome vector
+}
+transformed data {
+  real mean_y = mean(y);
+  real sd_y = sd(y);
+  print("mean_y: ", mean_y, ", ", "sd_y: ", sd_y);
+}
+parameters {
+  real mu;  // mean
+  real<lower=0> sigma;  // SD
+}
+transformed parameters {
+}
+model {
+  // priors
+  mu ~ normal(0, 5);
+  sigma ~ exponential(1);
+  // likelihood
+  y ~ normal(mu, sigma);
+}
+generated quantities {
+  real entropy = 0.5 * log(2 * pi() * e() * square(sigma));
+}
+```
+
+:::
+:::
+
+## Fit models using **cdmstanr**
+
+::: columns
+::: column
+
+```{r}
+# load cmdstanr and set number of cores
+library(cmdstanr)
+options(mc.cores = 4)
+
+# compile model
+# mean_mod <- cmdstan_model(stan_file = "Stan/mean.stan")
+
+# Stan data
+mean_dat <- list(I = I, y = y)
+
+# fit the model with NUTS
+mean_fit <- mean_mod$sample(data = mean_dat, 
+                            iter_warmup = 200, iter_sampling = 200, 
+                            save_warmup = T, refresh = 0)
+```
+
+:::
+::: column
+
+  -   `mod$sample()` runs Stan's HMC and yields a `CmdStanMCMC` object
+  -   `CmdStanMCMC` objects have associated methods
+      -   `fit$draws()` returns posterior draws for all quantities defined in `parameters`, `transformed parameters`, and `generated quantities`
+      -   `fit$summary()` summarises these quantities (means, uncertainty, diagnostics, etc.)
+  -   Check MCMC convergence ($\hat{R} \approx 1$) and diagnostics, especially divergent transitions
+
+:::
+:::
+
+## Traceplots and parameter summaries
+
+::: columns
+::: {.column .fragment}
+
+```{r}
+#| fig-asp: 1
+
+# traceplots
+pacman::p_load(bayesplot)
+mean_fit$draws(c("mu", "sigma"), inc_warmup = T) |> 
+  mcmc_trace(n_warmup = 200, facet_args = list(ncol = 1))
+```
+
+:::
+::: {.column .fragment}
+
+```{r}
+# summary
+mean_fit$summary() |> 
+  select(variable, median, contains("q"), ess_bulk, rhat)
+```
+
+:::
+:::
+
+## Plot posterior summeries
+
+```{r}
+#| fig-pos: right
+
+mean_fit$draws(c("mu", "sigma")) |> 
+  mcmc_intervals() + 
+  geom_point(aes(value, param),
+             data = tibble(param = c("mu", "sigma"), 
+                           value = c(mu, sigma)), 
+             position = position_nudge(y = 0.1), colour = "red4")
+```
+
+## Revisiting priors
+
+```{r}
+#| fig-asp: 1
+#| output-location: column
+
+pacman::p_load(posterior, tidybayes, distributional, ggdist)
+mean_fit |> 
+  gather_rvars(mu, sigma) |> 
+  mutate(.prior = c(dist_normal(0, 5), 
+                    dist_exponential(1))) |> 
+  ggplot() + 
+  facet_wrap(~ .variable, 
+             ncol = 1, 
+             scales = "free") + 
+  stat_slab(aes(xdist = .prior), 
+            alpha = 2/3) + 
+  stat_slab(aes(xdist = .value), 
+            alpha = 2/3, 
+            fill = "red4") + 
+  ggeasy::easy_remove_y_axis() + 
+  coord_cartesian(expand = F) +
+  labs(x = "Prior and posterior distributions")
+```
+
+## Two means and their difference
+
+::: {.columns align=center}
+::: {.column width="50%"}
+
+### *t*-test
+
+::: fragments
+::: fragment
+$$
+\begin{aligned}
+  y_i &\sim \mathrm{Normal}(\mu_{[g_i]}, \sigma_{[g_i]}), \quad   i \in 1:I, \ g \in 1:2 \\
+  \mu_1, \mu_2 &\sim p(.) \\
+  \sigma_1, \sigma_2 &\sim p(.) \\ 
+\end{aligned}
+$$
+:::
+::: fragment
+```{r}
+# generate 100 draws and plot
+mu[2] <- 2.2 ; sigma[2] <- sigma[1]
+g <- sample(1:2, I, replace = T)
+y <- rnorm(I, mu[g], sigma[g])
+tibble(y = y, g = g) |> ggplot(aes(y, factor(g))) + geom_dotplot(dotsize = 1/2) + labs(y = "group")
+```
+:::
+:::
+
+:::
+::: {.column width="50%" .fragment}
+
+```{stan output.var = "t_mod"}
+data {
+  int<lower=0> I;  // number of observations
+  vector[I] y;  // outcome vector
+  array[I] int<lower=1, upper=2> g;  // group identifier
+}
+parameters {
+  vector[2] mu;  // means
+  vector<lower=0>[2] sigma;  // SDs
+}
+model {
+  // priors
+  mu ~ normal(0, 5);
+  sigma ~ exponential(1);
+  
+  // likelihood
+  y ~ normal(mu[g], sigma[g]);
+}
+generated quantities {
+  // difference in means and SDs
+  real delta_mu = mu[2] - mu[1];
+  real delta_sigma = sigma[2] - sigma[1];
+}
+```
+
+:::
+:::
+
+## Fit the model and assess the difference in groups
+
+::: columns
+::: column
+
+```{r}
+# compile model
+# t_mod <- cmdstan_model(stan_file = "Stan/t.stan")
+
+# fit the model with NUTS
+t_fit <- t_mod$sample(data = list(I = I, y = y, g = g), 
+                      refresh = 0)
+```
+
+:::
+::: column
+
+```{r}
+# check the differences
+t_fit$draws(c("delta_mu", "delta_sigma")) |> 
+  mcmc_dens_chains()
+```
+
+:::
+:::
+
+## Another example
+
+::: columns
+::: column
+
+### Linear regression
+
+$$
+\begin{aligned}
+  y_i &\sim \mathrm{Normal}(\mu_i, \sigma), \quad   i \in 1:I \\
+  \mu_i &= \alpha + \beta \cdot x_i \\
+  \alpha, \beta, \sigma &\sim p(.) 
+\end{aligned}
+$$
+
+::: fragment 
+```{r}
+# simulate and plot data
+x <- rnorm(I) ; alpha <- -1 ; beta <- 0.5 ; sigma <- 0.8
+y <- rnorm(I, alpha + beta * x, sigma)
+lm_tbl <- tibble(x = x, y = y)
+ggplot(lm_tbl, aes(x, y)) + geom_point()
+```
+:::
+
+:::
+::: {.column .fragment}
+
+### Stan program
+
+Introducing `log_lik` and `yrep`
+
+```{stan output.var = "lm_mod"}
+data {
+  int<lower=0> I;  // number of observations
+  vector[I] y, x;  // outcome vector and covariate
+}
+parameters {
+  real alpha, beta;  // intercept and slope
+  real<lower=0> sigma;  // SD
+}
+model {
+  // priors
+  alpha ~ normal(0, 5);
+  beta ~ normal(0, 1);
+  sigma ~ exponential(1);
+  
+  // likelihood
+  // vector[I] mu = alpha + beta * x;
+  y ~ normal(alpha + beta * x, sigma);
+  // target += normal_lupdf(y | alpha + beta * x, sigma);
+}
+generated quantities {
+  // pointwise log-likelihood values
+  vector[I] log_lik;
+  for (i in 1:I) {
+    log_lik[i] = normal_lpdf(y[i] | alpha + beta * x[i], sigma);
+  }
+  
+  // posterior predictive distribution
+  array[I] real yrep = normal_rng(alpha + beta * x, sigma);
+}
+```
+
+:::
+:::
+
+## Fit model in Stan
+
+```{r}
+# compile model
+# lm_mod <- cmdstan_model(stan_file = "Stan/lm.stan")
+
+# Stan data
+lm_dat <- list(I = I, y = y, x = x) |> glimpse()
+```
+
+```{r}
+#| output: true
+
+# fit the model with NUTS
+lm_fit <- lm_mod$sample(data = lm_dat, refresh = 0)
+```
+
+## Parameter summaries
+
+```{r}
+# check output
+lm_fit$summary(c("alpha", "beta", "sigma")) |> 
+  mutate(truth = c(alpha, beta, sigma)) |> 
+  select(-sd, -mad)
+```
+
+## Traceplots
+
+```{r}
+# check traceplots
+lm_fit$draws(c("alpha", "beta", "sigma")) |> mcmc_trace()
+```
+
+## Making predictions
+
+```{r}
+pacman::p_load(tidybayes, ggdist)
+
+x_pred <- seq(min(x), max(x), length.out = 200)
+lm_fit |> 
+  spread_draws(alpha, beta, sigma)
+```
+
+## Making predictions
+
+```{r}
+pacman::p_load(tidybayes, ggdist)
+
+x_pred <- seq(min(x), max(x), length.out = 200)
+lm_fit |> 
+  spread_draws(alpha, beta, sigma) |> 
+  crossing(x = x_pred)
+```
+
+4000 draws $\times$ 200 input values = 800,000 rows
+
+## Making predictions
+
+```{r}
+#| output-location: column
+
+pacman::p_load(tidybayes, ggdist)
+
+x_pred <- seq(min(x), max(x), length.out = 200)
+lm_fit |> 
+  spread_draws(alpha, beta, sigma) |> 
+  crossing(x = x_pred) |>
+  mutate(mu = alpha + beta * x) |> 
+  ggplot(aes(x, mu)) + 
+  stat_lineribbon(.width = 0.9, 
+                  fill = "blue4", 
+                  alpha = 1/2) + 
+  geom_point(aes(y = y), 
+             data = lm_tbl, 
+             alpha = 2/3)
+```
+
+## Goodness-of-fit
+
+::: columns
+::: column
+
+  -   Two main ways of checking fit: cross-validation (CV) and posterior predictive checking (PPC)
+  -   CV: how well does the model predict unseen or new data?
+  -   PPC: how well do our model-based predictions match our observed data?
+  -   Intuition: if our model fits well, then it should generate predictions that look similar to our observed data
+
+:::
+::: {.column .fragment}
+
+```{r}
+pp_check(object = lm_dat$y, 
+         yrep = lm_fit$draws("yrep", format = "draws_matrix")[1:50, ], 
+         fun = ppc_dens_overlay)
+```
+
+:::
+:::
+
+::: fragment
+::: {.callout-important}
+*Prior* predictive checks simulate potential data from the joint prior distribution. *Posterior* predictive checks simulate potential data from the joint posterior distribution *after learning parameters from data*.
+:::
+:::
+
+## Leave-one-out CV
+
+::: {.nonincremental}
+
+  -   Leave-one-out CV: LOO-CV
+  -   Predictive performance of the model by leaving one observation out at a time
+  -   Pareto-smoothed importance sampling LOO-CV: PSIS-LOO
+  -   Requires we need posterior draws for observation-level `log_lik`
+      
+:::
+
+::: columns
+::: column
+
+```{r}
+lm_loo <- lm_fit$loo()
+lm_loo
+```
+
+:::
+::: column
+
+```{r}
+plot(lm_loo)
+```
+
+:::
+:::
+
+## One more example
+
+::: columns
+::: column
+
+### Logistic ANCOVA?
+
+$$
+\begin{aligned}
+  y_i &\sim \mathrm{Bernoulli}(\psi_i), \quad   i \in 1:I, \ g \in 1:G \\
+  \psi_i &= \operatorname{logit}^{-1} (\alpha_{[g_i]} + \beta \cdot x_i) \\
+  \alpha_{g}, \beta &\sim p(.) 
+\end{aligned}
+$$
+
+::: fragment
+```{r}
+# simulate
+G <- 4
+g <- sample(1:G, I, replace = T)
+x <- rnorm(I)
+alpha <- rnorm(G)
+beta <- 0.5
+inv_logit <- function(p) 1 / (1 + exp(-p))
+psi <- inv_logit(alpha[g] + beta * x)
+y <- rbinom(I, 1, psi)
+```
+:::
+:::
+::: {.column .fragment}
+
+```{r}
+#| fig-asp: 0.8
+
+# plot
+tibble(g = g, x = x, y = y) |> 
+  ggplot(aes(x, y)) + 
+  facet_wrap(~ g, labeller = label_both) + 
+  geom_point(alpha = 1/2) + 
+  scale_y_continuous(breaks = seq(0, 1, 0.5))
+```
+
+:::
+:::
+
+## Stan program
+
+```{stan output.var = "glm_mod"}
+data {
+  int<lower=1> I, G;  // number of observations and groups
+  array[I] int<lower=0, upper=1> y;  // binary outcome array
+  vector[I] x;  // continuous covariate
+  array[I] int<lower=1, upper=G> g;  // group identifier
+}
+parameters {
+  vector[G] alpha;  // group-level intercepts
+  real beta;  // slope
+}
+model {
+  // priors
+  alpha ~ logistic(0, 1);
+  beta ~ normal(0, 1);
+  
+  // likelihood
+  y ~ bernoulli_logit(alpha[g] + beta * x);
+  // y ~ bernoulli(inv_logit(alpha[g] + beta * x));
+}
+generated quantities {
+  vector[I] log_lik;
+  for (i in 1:I) {
+    log_lik[i] = bernoulli_logit_lpmf(y[i] | alpha[g[i]] + beta * x[i]);
+  }
+  array[I] int yrep = bernoulli_logit_rng(alpha[g] + beta * x);
+}
+```
+
+## Fit the model in Stan
+
+::: columns
+::: column
+
+```{r}
+# compile model
+# glm_mod <- cmdstan_model(stan_file = "Stan/glm.stan")
+
+# Stan data
+glm_dat <- list(I = I, G = G, y = y, x = x, g = g) |> glimpse()
+
+# fit with NUTS
+glm_fit <- glm_mod$sample(data = glm_dat, refresh = 0)
+```
+
+:::
+::: column
+
+```{r}
+# estimates
+glm_fit$draws(c("alpha", "beta")) |> 
+  mcmc_intervals() + 
+  geom_point(aes(value, param),
+             data = tibble(param = c(str_c("alpha[", 1:G, "]"), "beta"), 
+                           value = c(alpha, beta)), 
+             position = position_nudge(y = 0.1), colour = "red4")
+```
+
+:::
+:::
+
+## Goodness-of-fit
+
+::: columns
+::: column
+
+### PSIS-LOO
+
+```{r}
+glm_loo <- glm_fit$loo()
+plot(glm_loo)
+```
+
+:::
+::: column
+
+### PPC
+
+```{r}
+pp_check(object = glm_dat$y, 
+         yrep = glm_fit$draws("yrep", format = "draws_matrix")[1:500, ], 
+         group = glm_dat$g, 
+         fun = ppc_bars_grouped)
+```
+
+:::
+:::
+
+::: fragment
+
+
+## References

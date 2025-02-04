@@ -1,0 +1,758 @@
+---
+title: Mark-Recapture Workshop 2024
+subtitle: Introduction to Mark-Recapture
+author: Dr. Matthijs Hollanders
+format:
+  revealjs:
+    logo: "../logo/Logo-Quantecol-RGB-FA-1-2000.png"
+    smaller: true
+    incremental: true
+    slide-number: true
+    standalone: true
+    embed-resources: true
+bibliography: '`r here::here("R/refs.bib")`'
+execute:
+  echo: true
+---
+  
+```{r}
+#| echo: false
+
+# load packages
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(tidyverse, here, cmdstanr)
+
+# load and set theme
+if (file.exists(here("R/my-theme.R"))) {
+  source(here("R/my-theme.R"))
+  theme_set(my_theme(base_size = 20))
+}
+register_knitr_engine(override = T)
+```
+
+## Mark-recapture sampling
+
+  -   Conduct multiple surveys for wildlife
+  -   Every new animal gets a uniquely identifiable mark
+  -   Some animals are recaptured some of the time
+  -   *Time series*: everything we care about is informed by recaptures of individuals
+  -   Parameters to be estimated: survival, recruitment, some dynamics, detection
+  -   Derived quantities: population size
+  
+::: fragment
+::: {.callout-important}
+Spatial capture-recapture (SCR) models are different from survey-based traditional models. Traditional models estimate survival between recaptures, whereas SCR models estimate population size or density directly.
+:::
+:::
+  
+## Hidden Markov Models
+
+  -   Broad class of models that encompass a huge amount of ecological models
+      -   Mark-recapture, occupancy, *N*-mixture
+  -   (Partially) unobserved *latent* process (time series)
+      -   Animals surviving or dying
+  -   *Observation* process conditioned on this latent process
+      -   Animals getting detected or not
+  
+![@glennie2023](../img/hmm.png){width="60%"}
+
+## Cormack-Jolly-Seber model
+
+$$
+\begin{aligned}
+  z_{i,j} &\sim \mathrm{Bernoulli} ( z_{i,j-1} \cdot \phi ), \quad i \in 1:I, \ j \in (f_i + 1):J \\
+  y_{i,j} &\sim \mathrm{Bernoulli} ( z_{i,j} \cdot p) \\ 
+  \phi, p &\sim \mathrm{Beta}(1, 1)
+\end{aligned}
+$$
+ 
+  -   $z_{i,j}$: ecological state (1 = alive, 0 = dead) of individual $i$ at time $j$
+  -   $y_{i,j}$: observed state (1 = observed, 0 = not observed) of individual $i$ at time $j$
+  -   $f_i$: occasion (survey) of first capture (model *starts* here!)
+  -   $\phi$: apparent survival probability
+      -   Probability of surviving from time $j-1$ to time $j$
+  -   $p$: detection probability
+      -   Probability of detecting the individual if it is alive
+  -   $\mathrm{Beta}(1, 1)$ is a uniform prior on [0,1]
+  
+## Mark-recapture yields *detection histories*
+
+::: columns
+::: column
+
+```{r}
+# simulation input
+I <- 100
+J <- 9
+f <- sample(1:J, I, replace = T) |> sort()
+phi <- 0.7
+p <- 0.3
+
+# matrix of ecological and observed states
+z <- y <- matrix(NA, I, J)
+for (i in 1:I) {
+  z[i, f[i]] <- y[i, f[i]] <- 1
+  if (f[i] < J) {
+    for (j in (f[i] + 1):J) {
+      z[i, j] <- rbinom(1, 1, z[i, j - 1] * phi)
+      y[i, j] <- rbinom(1, 1, z[i, j] * p)
+    }
+  }
+}
+```
+
+:::
+::: column
+
+```{r}
+head(z, 6)
+head(y, 6)
+```
+
+:::
+:::
+
+::: {.callout-note}
+Bernoulli distribution is a coin-flip with probability $p$.
+
+Binomial distribution is the number of successes after $N$ coin-flips with probability $p$.
+:::
+
+## BUGS/JAGS/NIMBLE treat latent states as unknown parameters
+
+::: columns
+::: column
+
+```{r}
+library(nimble)
+cmr_code <- nimbleCode({
+  # priors
+  phi ~ dbeta(1, 1)
+  p ~ dbeta(1, 1)
+  # likelihood
+  for (i in 1:I) {
+    # initial state is known
+    z[i, f[i]] <- y[i, f[i]]
+    # subsequent surveys
+    for (j in (f[i] + 1):J) {
+      z[i, j] ~ dbern(z[i, j - 1] * phi)
+      y[i, j] ~ dbern(z[i, j] * p)
+    }
+  }
+})
+```
+
+:::
+::: column
+
+```{r}
+#| echo: false
+
+# create NIMBLE model object
+Rmodel <- nimbleModel(cmr_code, 
+                      constants = list(I = I, J = J, f = f),
+                      data = list(y = y))
+```
+
+```{r}
+# configure MCMC
+conf <- configureMCMC(Rmodel)
+```
+
+:::
+:::
+
+## No discrete parameters in HMC
+
+::: incremental
+
+  -   Marginalisation: sum over the mutually exclusive possibilities
+  -   More complex to code, but advantageous
+      -   More efficient computation
+      -   Better estimation of the discrete parameter, ironically
+  -   Mark-recapture: if not detected, two possibilities
+      -   $\phi \cdot (1 - p)$: survived but not detected
+      -   $1 - \phi$: not survived (so not detected)
+      -   $\Pr(A \cap B) = \Pr(A) + \Pr(B)$
+      -   $\phi \cdot (1 - p) + (1 - \phi)$: mutually exclusive probabilities
+      -   `log_sum_exp()` performs this on the log scale
+  -   Multiple ways of dealing with marginalisation, but we will focus on forward algorithm
+
+:::
+  
+## Forward algorithm
+
+  -   General purpose algorithm for computing the likelihood of hidden Markov models
+  -   Programmatically "update" probabilities of each latent state
+  -   Multistate formulation---relevant for more complex mark-recapture models!
+  
+::: {.columns .fragment}
+::: column
+
+  -   Transition probability matrix (stochastic matrix)
+      -   Right stochastic: rows sum to 1
+      -   Left stochastic: columns sum to 1
+  -   0s and 1s replaced with 1s and 2s
+      -   1 = Alive
+      -   2 = Dead
+      
+:::
+::: column
+
+$$
+\begin{aligned}
+\boldsymbol{P_z} &= \begin{bmatrix}
+  1 & 0 \\
+  1 - \phi & \phi
+\end{bmatrix} \\
+\boldsymbol{P_y} &= \begin{bmatrix}
+  1 & 0 \\
+  1 - p & p
+\end{bmatrix}
+\end{aligned}
+$$
+
+:::
+:::
+
+## In action
+
+::: columns
+::: {.column .nonincremental}
+  
+  0.    Define a $2 \cdot J$ matrix of state-specific probabilities up to survey $j$ ($\boldsymbol{\Omega}$)
+  1.    Begin with initial state probabilities ($[0, 1]^\intercal$ in mark-recapture)
+  2.    Matrix multiply with ecological TPM (yields a vector)
+  3.    Element-wise multiply with observation process
+        a.    Subset column from observation TPM
+        b.    If not detected: $y=1 \rightarrow [1, 1-p]^\intercal$
+        c.    If detected: $y=2 \rightarrow [0, p]^\intercal$
+  4.    Repeat for each time step (survey)
+  5.    Sum state-specific probabilities at the last time step
+  
+:::
+::: column
+
+**Second survey, detected**
+
+$$
+\begin{aligned}
+\boldsymbol{\Omega}_{[:2]} &= \boldsymbol{P_z}^\intercal \cdot \boldsymbol{\Omega}_{[:1]} \odot {\boldsymbol{P_y}}_{[:y_{i, 2}]} \\
+&= \overbrace{\begin{bmatrix}
+  1 & 1 - \phi \\
+  0 & \phi
+\end{bmatrix}}^{\boldsymbol{P_z}^\intercal} \cdot \overbrace{\begin{bmatrix} 
+  0 \\ 
+  1
+\end{bmatrix}}^{\boldsymbol{\Omega}_{[:1]}} \odot \overbrace{\begin{bmatrix} 
+  0 \\ 
+  p
+\end{bmatrix}}^{\textrm{Detected}} \\
+&= \begin{bmatrix}
+  1 \cdot 0 + (1 - \phi) \cdot 1 \\ 
+  0 \cdot 0 + \phi \cdot 1
+\end{bmatrix} \odot \begin{bmatrix} 
+  0 \\ 
+  p
+\end{bmatrix} \\
+&= \begin{bmatrix}
+  1 - \phi \\
+  \phi
+\end{bmatrix} \odot \begin{bmatrix} 
+  0 \\ 
+  p
+\end{bmatrix} \\
+&= \begin{bmatrix}
+  0 \\
+  \phi \cdot p
+\end{bmatrix}
+\end{aligned}
+$$
+:::
+:::
+
+## Third survey, not detected
+
+$$
+\begin{aligned}
+\boldsymbol{\Omega}_{[:3]} &= \boldsymbol{P_z}^\intercal \cdot \boldsymbol{\Omega}_{[:2]} \odot {\boldsymbol{P_y}}_{[:y_{i, 3}]} \\
+&= \overbrace{\begin{bmatrix}
+  1 & 1 - \phi \\
+  0 & \phi
+\end{bmatrix}}^{\boldsymbol{P_z}^\intercal} \cdot \overbrace{\begin{bmatrix} 
+  0 \\ 
+  \phi \cdot p
+\end{bmatrix}}^{\boldsymbol{\Omega}_{[:2]}} \odot \overbrace{\begin{bmatrix} 
+  1 \\ 
+  1 - p
+\end{bmatrix}}^{\textrm{Not detected}} \\
+&= \begin{bmatrix}
+  1 \cdot 0 + (1 - \phi) \cdot \phi \cdot p \\ 
+  0 \cdot 0 + \phi \cdot \phi \cdot p
+\end{bmatrix} \odot \begin{bmatrix} 
+  1 \\ 
+  1 - p
+\end{bmatrix} \\
+&= \begin{bmatrix}
+  (1 - \phi) \cdot \phi \cdot p \\
+  \phi^2 \cdot p
+\end{bmatrix} \odot \begin{bmatrix} 
+  1 \\ 
+  1 - p
+\end{bmatrix} \\
+&= \begin{bmatrix}
+  (1 - \phi) \cdot \phi \cdot p \\
+  \phi^2 \cdot p \cdot (1 - p)
+\end{bmatrix}
+\end{aligned}
+$$
+
+## Quick sojourn into multistate models
+
+  -   Multistate models are useful when we want to decompose the alive states into categories
+      -   Infected and uninfected, breeding and non-breeding, juvenile and adult, etc.
+  -   Example: frogs dealing with the amphibian chytrid fungus
+      -   State 1: dead; state 2: alive and uninfected; state 3: alive and infected
+
+::: fragments
+::: fragment
+
+\emphasize{Ecological TPM}
+  
+$$
+\boldsymbol{P_z} = \begin{bmatrix}
+  1 & 0 & 0 \\
+  1 - \phi_1 & \phi_1 \cdot (1 - \psi_1) & \phi_1 \cdot \psi_1 \\
+  1 - \phi_2 & \phi_2 \cdot \psi_2 & \phi_2 \cdot (1 - \psi_2)
+\end{bmatrix}
+$$
+
+:::
+::: fragment
+
+$$
+\boldsymbol{P_y} = \begin{bmatrix}
+  1 & 0 & 0 \\
+  1 - p_1 & p_1 & 0 \\
+  1 - p_2 & p_2 \cdot (1 - \delta) & p_2 \cdot \delta
+\end{bmatrix}
+$$
+
+:::
+:::
+
+## Stan program for mark-recapture
+
+::: columns
+::: {.column width="65%"}
+
+```{stan output.var="cjs_mod_p"}
+data {
+  int<lower=1> I, J;  // number of individuals and surveys
+  array[I] int<lower=1, upper=J> f;  // first capture
+  array[I, J] int<lower=1, upper=2> y;   // detection history
+}
+
+parameters {
+  real<lower=0, upper=1> phi, p;
+}
+
+transformed parameters {
+  // ecological TPM (left stochastic)
+  matrix[2, 2] P_z = [[ 1, 0 ], 
+                      [ 1 - phi, phi ]]';
+                          
+  // observation TPM (right stochastic)
+  matrix[2, 2] P_y = [[ 1, 0 ], 
+                      [ 1 - p, p ]];
+}
+
+model {
+  // priors
+  target += beta_lupdf(phi | 1, 1); // phi ~ beta(1, 1)
+  target += beta_lupdf(p | 1, 1);  // p ~ beta(1, 1)
+  
+  // likelihood
+  matrix[2, J] Omega;  // marginal state-specific probabilities
+  for (i in 1:I) {
+    Omega[:, f[i]] = [ 0, 1 ]';
+    for (j in (f[i] + 1):J) {
+      Omega[:, j] = P_z * Omega[:, j - 1] .* P_y[:, y[i, j]];
+    }
+    target += log(sum(Omega[:, J]));
+  }
+}
+
+generated quantities {
+  vector[I] log_lik;
+  {
+    matrix[2, J] Omega;
+    for (i in 1:I) {
+      Omega[:, f[i]] = [ 0, 1 ]';
+      for (j in (f[i] + 1):J) {
+        Omega[:, j] = P_z * Omega[:, j - 1] .* P_y[:, y[i, j]];
+      }
+      log_lik[i] = log(sum(Omega[:, J]));
+    }
+  }
+}
+```
+
+:::
+::: {.column width="35%"}
+
+::: {.fragments .fade-in-then-out}
+::: fragment
+$$
+\begin{aligned}
+\boldsymbol{P_z} &= \begin{bmatrix}
+  1 & 0 \\
+  1 - \phi & \phi
+\end{bmatrix} \\
+\boldsymbol{P_y} &= \begin{bmatrix}
+  1 & 0 \\
+  1 - p & p
+\end{bmatrix}
+\end{aligned}
+$$
+:::
+
+::: fragment
+
+$$
+\begin{aligned}
+  \boldsymbol{\Omega}_{[:f_i]} &= [ 0, 1 ]^\intercal \\
+  \boldsymbol{\Omega}_{[:j]} &= \boldsymbol{P_z}^\intercal \cdot \boldsymbol{\Omega}_{[:j-1]} \odot \boldsymbol{{P_y}}_{[:y_{i, j}]} \\
+  \mathcal{L}_i &= \sum_{i=1}^2 \boldsymbol{\Omega}_{i,J}
+\end{aligned}
+$$
+:::
+
+::: fragment
+::: {.callout-note}
+Log-likelihood values `log_lik[i]` should be computed at the level of the site, not the survey. 
+:::
+:::
+:::
+:::
+:::
+
+## Fitting the model
+
+::: columns
+::: column
+
+```{r}
+# compile model
+# cjs_mod_p <- cmdstan_model("Stan/cjs_p.stan")
+
+# update data for Stan, and no NAs
+y_stan <- y + 1
+y_stan[is.na(y_stan)] <- 1
+cjs_dat <- list(I = I, J = J, f = f, y = y_stan) |> glimpse()
+
+# fit model
+cjs_p_fit <- cjs_mod_p$sample(cjs_dat, refresh = 0)
+```
+
+:::
+::: column
+
+```{r}
+# summary and loo
+cjs_p_fit$summary(c("phi", "p")) |> 
+  select(variable, median, q5, q95) |> 
+  mutate(truth = c(phi, p))
+cjs_p_fit$loo()
+```
+
+:::
+:::
+
+## Stan program on the log scale
+
+::: columns
+::: {.column width="65%"}
+
+```{stan output.var="cjs_mod_lp"}
+functions {
+  /** 
+   * Return the natural logarithm of the product of the 
+   * elementwise exponentiation of a matrix and vector
+   *
+   * @param A  First matrix
+   * @param B  Second vector
+   *
+   * @return   log(exp(A) * exp(B))
+   */
+  vector log_prod_exp(matrix A, vector B) {
+    int I = rows(A);
+    int J = cols(A);
+    matrix[J, I] A_tr = A';
+    vector[I] C;
+    for (i in 1:I) {
+      C[i] = log_sum_exp(A_tr[:, i] + B);
+    }
+    return C;
+  }
+}
+
+data {
+  int<lower=1> I, J;  // number of individuals and surveys
+  array[I] int<lower=1, upper=J> f;  // first capture
+  array[I] int<lower=f, upper=J> l;  // last capture
+  array[I, J] int<lower=1, upper=2> y;   // detection history
+}
+
+parameters {
+  real<lower=0, upper=1> phi, p;
+}
+
+model {
+  // pre-compute log probabilities
+  real log_phi = log(phi), log1m_phi = log1m(phi);
+  real log_p = log(p), log1m_p = log1m(p);
+  
+  // log TPMs (per individual and survey)
+  array[I, J] matrix[2, 2] log_P_z, log_P_y;
+  for (i in 1:I) {
+    for (j in (f[i] + 1):J) {
+      log_P_z[i, j] = [[ 0, negative_infinity() ], 
+                       [ log1m_phi, log_phi ]]';
+      log_P_y[i, j] = [[ 0, negative_infinity() ], 
+                       [ log1m_p, log_p ]];
+    }
+  }
+  
+  // priors
+  target += beta_lupdf(phi | 1, 1);
+  target += beta_lupdf(p | 1, 1);
+  
+  // likelihood
+  matrix[2, J] Omega;  // marginal state-specific log probabilities
+  for (i in 1:I) {
+    
+    // first to last capture
+    Omega[2, f[i]] = 0;
+    for (j in (f[i] + 1):l[i]) {
+      Omega[2, j] = log_P_z[i, j][2, 2] + Omega[2, j - 1]
+                    + log_P_y[i, j][2, y[i, j]];
+    }
+    Omega[1, l[i]] = negative_infinity();
+    
+    // after last capture
+    for (j in (l[i] + 1):J) {
+      Omega[:, j] = log_prod_exp(log_P_z[i, j], Omega[:, j - 1])
+                    + log_P_y[i, j][:, y[i, j]];
+    }
+    target += log_sum_exp(Omega[:, J]);
+  }
+}
+
+generated quantities {
+  vector[I] log_lik;
+  array[I, J] int z;
+  {
+    real log_phi = log(phi), log1m_phi = log1m(phi);
+    real log_p = log(p), log1m_p = log1m(p);
+    // log TPMs
+    array[I, J] matrix[2, 2] log_P_z, log_P_y;
+    for (i in 1:I) {
+      for (j in (f[i] + 1):J) {
+        log_P_z[i, j] = [[ 0, log1m_phi ], 
+                         [ negative_infinity(), log_phi ]];
+        log_P_y[i, j] = [[ 0, negative_infinity() ], 
+                         [ log1m_p, log_p ]];
+      }
+    }
+    
+    // log-likelihood (mirrors model{} block)
+    matrix[2, J] Omega;
+    for (i in 1:I) {
+      Omega[2, f[i]] = 0;
+      for (j in (f[i] + 1):l[i]) {
+        Omega[2, j] = log_P_z[i, j][2, 2] + Omega[2, j - 1]
+                      + log_P_y[i, j][2, y[i, j]];
+      }
+      Omega[1, l[i]] = negative_infinity();
+      for (j in (l[i] + 1):J) {
+        Omega[:, j] = log_prod_exp(log_P_z[i, j], Omega[:, j - 1])
+                      + log_P_y[i, j][:, y[i, j]];
+      }
+      log_lik[i] = log_sum_exp(Omega[:, J]);
+    }
+    
+    // Viterbi algorithm for latent states (0 = dead, 1 = alive)
+    vector[2] lp;
+    matrix[2, J] best_lp;
+    array[2, J] int back_pointer;
+    for (i in 1:I) {
+      z[i, f[i]:l[i]] = ones_int_array(l[i] - f[i] + 1);
+      best_lp[:, l[i]] = [ negative_infinity(), 0 ]';
+      for (j in (l[i] + 1):J) {
+        for (a in 1:2) {
+          lp = log_P_z[i, j][a]' + best_lp[:, j - 1]
+               + log_P_y[i, j][:, 1];
+          back_pointer[a, j] = sort_indices_desc(lp)[1] - 1;
+          best_lp[a, j] = max(lp);
+        }
+      }
+      z[i, J] = sort_indices_desc(best_lp[:, J])[1] - 1;
+      for (j in (l[i] + 1):(J - 1)) {
+        int jj = J + l[i] - j;  // reverse the indexing
+        z[i, jj] = back_pointer[z[i, jj + 1] + 1, jj + 1];
+      }
+    }
+  }
+}
+```
+
+:::
+::: {.column .incremental width="35%"}
+
+  -   *All* `parameters` and `transformed parameters` are saved
+  -   Increased efficiency by ignoring the dead state until last capture
+  -   Repeating things in `generated quantities` is more efficient at the cost of being more verbose
+  -   Viterbi algorithm tracks the most likely sequence of hidden states to generate the observed data
+  
+
+:::
+:::
+
+## Fitting the new parameterisation
+
+::: columns
+::: column
+
+```{r}
+# compile model
+# cjs_mod_lp <- cmdstan_model("Stan/cjs.stan")
+
+# update data for Stan, and no NAs
+l <- apply(y, 1, \(x) max(which(x == 1)))
+cjs_dat$l <- l
+glimpse(cjs_dat)
+
+# fit model
+cjs_lp_fit <- cjs_mod_lp$sample(cjs_dat, refresh = 0)
+```
+
+:::
+::: column
+
+```{r}
+# check out latent states
+z_est <- cjs_lp_fit$summary("z")$median |>
+  matrix(I, J) |>
+  {\(z) ifelse(z < 0, NA, z)}()
+head(z_est)
+sum(z_est == z, na.rm = T) / sum(!is.na(z))
+
+# model comparison with loo
+loo::loo_compare(cjs_p_fit$loo(), cjs_lp_fit$loo())
+```
+
+:::
+:::
+
+## Individual and survey effects
+
+::: columns
+
+::: {.column .incremental width="35%"}
+
+  -   Individuals may differ in their survival or detection probabilities
+  -   Temporal effects may manifest on survival or detection probabilities
+  -   Some covariates change over time within individuals (body condition, etc.)
+  -   Pragmatic Bayesian: this stuff is trivial to implement in a Stan program
+  
+:::
+::: {.column .fragment width="65%"}
+
+```{.stan}
+data {
+  int<lower=1> I, J;  // number of individuals and surveys
+  array[I] int<lower=1, upper=J> f;  // first capture
+  matrix[2, I] x_i;  // matrix of individual-level covariates
+  matrix[4, J] x_j;  // matrix of survey-level covariates
+  // ...
+}
+
+parameters {
+  real logit_phi_a, logit_p_a;
+  vector[6] logit_phi_b, logit_p_b;
+}
+
+transformed parameters {
+  matrix[J, I] logit_phi, logit_p;
+  for (i in 1:I) {
+    for (j in (f[i] + 1):J) {
+      logit_phi[i, j] = logit_phi_a
+                        + logit_phi_b[1] * x_i[1, i]
+                        + logit_phi_b[2] * x_i[2, i]
+                        + logit_phi_b[3] * x_j[1, j]
+                        + logit_phi_b[4] * x_j[2, j]
+                        + logit_phi_b[5] * x_j[3, j];
+      //...and similar for logit_p_b
+    }
+  }
+}
+
+model {
+  // log TPMs
+  array[I, J] matrix[2, 2] log_P_z, log_P_y;
+  for (i in 1:I) {
+    for (j in (f[i] + 1):J) {
+      log_P_z[i, j] = [[ 0, log1m_inv_logit(logit_phi[i, j]) ], 
+                       [ negative_infinity(), log_inv_logit(logit_phi[i, j]) ]];
+      log_P_y[i, j] = [[ 0, negative_infinity() ], 
+                       [ log1m_inv_logit(logit_p[i, j]), log_inv_logit(logit_p[i, j]) ]];
+    }
+  }
+  
+  // priors
+  target += logistic_lupdf(logit_phi_a | 0, 1);
+  target += logistic_lupdf(logit_p_a | 0, 1);
+  target += std_normal_lupdf(logit_phi_b);
+  target += std_normal_lupdf(logit_p_b);
+  
+  //...
+}
+```
+
+:::
+:::
+
+## Jolly-Seber model
+
+States: not yet entered (1), alive (2), dead (3)
+  
+$$
+\boldsymbol{P_z} = \begin{bmatrix}
+  1 - \gamma & \gamma & 0 \\
+  0 & \phi & 1 - \phi \\
+  0 & 0 & 1
+\end{bmatrix}, \quad
+\boldsymbol{P_y} = \begin{bmatrix}
+  1 & 0 \\
+  1 - p & p \\
+  1 & 0 
+\end{bmatrix}
+$$
+
+
+  -   Doesn't condition on first capture, but models the *entry* process with removal entry probability $\gamma$, or how individuals are entering the study system
+  -   Recruitment can be derived; however, this is recruitment of the individuals that fit inclusion criteria (i.e., adults)
+  -   Care must be taken to interpret these parameters as fecundity
+  -   Practical differences with CJS:
+      -   Introduce a bunch of "dummy" individuals that may have existed
+      -   Add a first column to the detection history of "not detected" for all individuals
+      -   Estimate "superpopulation" and survey-level abundance
+
+## Key take-aways
+  
+  -   The likelihood as implemented through the forward algorithm remains roughly unchanged regardless of model complexity
+  -   We just model the parameters governing the ecological and detection parameters more flexibly
+  
+## References
+

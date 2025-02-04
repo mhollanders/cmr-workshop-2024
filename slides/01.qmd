@@ -1,0 +1,330 @@
+---
+title: Mark-Recapture Workshop 2024
+subtitle: Introduction to (Bayesian) Statistics
+author: Dr. Matthijs Hollanders
+format:
+  revealjs:
+    logo: "../logo/Logo-Quantecol-RGB-FA-1-2000.png"
+    smaller: true
+    slide-number: true
+    incremental: true
+    standalone: true
+    embed-resources: true
+bibliography: '`r here::here("R/refs.bib")`'
+execute:
+  echo: true
+---
+
+```{r}
+#| echo: false
+
+# load packages
+if(!require(pacman)) install.packages("pacman")
+pacman::p_load(tidyverse, here)
+
+# load and set theme
+if (file.exists(here("R/my-theme.R"))) {
+  source(here("R/my-theme.R"))
+  theme_set(my_theme(base_size = 20))
+}
+```
+
+## Structure of the course
+
+  1.  Wednesday (today)
+      a.  Introduction to (Bayesian) Statistics
+      b.  Bayesian Modeling with Stan using CmdStanR
+      c.  Introduction to Mark-Recapture (in Stan)
+  2.  Thursday
+      a.  Developing the tiger snake model
+      b.  I'll be open to consultation on different projects
+  3.  Friday
+      a.  Hopefully a production-level model
+      b.  Additional projects
+
+::: fragment
+I'm flexible and open to suggestions!
+:::
+
+## What to expect
+
+  -   Workshop is designed as a crash course to Bayesian statistics, Stan, and a variety of models
+  -   If things go to fast, don't worry
+  -   Course is designed for completeness, with not everything needing to be understood (e.g., forward algorithm for mark-recapture)
+  -   Emphasis on simulation: if we can generate data, we should be able to recover it
+  -   Feel free to interrupt me when something isn't understood!
+  -   All slides, code, and models available at [github.com/mhollanders/cmr-workshop-2024](https://github.com/mhollanders/cmr-workshop-2024)
+
+::: fragment
+`git clone https://github.com/mhollanders/cmr-workshop.git`
+
+But don't you dare use my custom ggplot2 theme
+:::
+
+## About me
+
+  -   PhD in disease ecology from 2019--2023 (Southern Cross University)
+  -   Postdoctoral Research Fellow 2023--2025 (University of Canberra/NSW DPIE)
+  -   Started Quantecol in 2022 for statistical consulting
+
+## Statistics is hard
+
+::: columns
+::: {.column width="40%"}
+
+  -   Many researchers struggle with statistics, especially during their tertiary education
+      -   Intrinsic difficulty
+      -   Pedagogical challenges
+  -   Often our data is too complex to be solved by standard methods, especially with ecological data
+  
+:::
+::: {.column width="60%"}
+
+::: fragment
+![](../img/flowchart.png){width="100%"}
+:::
+
+:::
+:::
+
+## Frequentist vs. Bayesian
+
+::: columns
+::: {.column width="50%" .fragment}
+
+### Frequentists
+
+  -   Probability is the long-run frequency of an event occurring
+  -   Parameters are fixed, and the data is conditioned on them: $\Pr{(y \mid \theta)}$
+  -   Focuses on what would happen with hypothetical many repetitions of an experiment
+  -   Estimation is about point estimates (maximum likelihood) and asymptotic approximations for uncertainty (fast)
+  
+:::
+::: {.column width="50%" .fragment}
+
+### Bayesians
+
+  -   Probability represents a degree of belief or uncertainty around an event
+  -   Parameters are random variables, and they are conditioned on the observed data: $\Pr{(\theta \mid y)}$
+  -   Focuses on updating our beliefs about a system
+  -   Estimation is about quantifying uncertainty and describing the random variables (slow)
+  
+:::
+:::
+
+## Bayes' Rule(s)
+
+$$
+\begin{aligned}
+  \Pr{(\theta \mid y)} &= \frac{\Pr{(y \mid \theta)} \cdot \Pr{(\theta)}}{\Pr{(y)}} \\
+                       &\propto \Pr{(y \mid \theta)} \cdot \Pr{(\theta)}
+\end{aligned}
+$$
+ 
+  -   $\Pr{(\theta \mid y)}$: probability of the parameters given the data (posterior distribution)
+  -   $\Pr{(y \mid \theta)}$: probability of the data given the parameters (likelihood)
+  -   $\Pr{(\theta)}$: probability of the parameters (prior distribution)
+  -   $\Pr{(y)}$: probability of the data (marginal distribution of the data); we don't need it
+  -   When modeling, we just need to (1) write the likelihood for the data and (2) specify reasonable prior distributions---more on this later
+
+## Pragmatic Bayesian
+
+  -   Frequentist methods struggle with complex models (hierarchical models, random effects, etc.)
+  -   Probabilistic programming languages (PPL) afford *much* greater flexibility
+  -   Use the PPL for all statistical needs
+  -   Get an intuitive understanding of statistics
+  -   Flexibility
+  -   Creativity?
+  -   There's many reasons to be a Bayesian, but the philosophical justification is just one of them
+  
+## Markov chain Monte Carlo
+
+  -   Analytically deriving the posterior distribution requires solving integrals that are too complex
+  -   Markov chain Monte Carlo (MCMC)
+      -   Developed by Metropolis (1953)
+      -   A family of methods for sampling from a probability distribution
+      -   Draw samples from our *joint posterior distribution*
+      -   Parameter estimates are summaries of *posterior draws*
+          -   Centrality: mean, median, mode
+          -   Uncertainty: SD, 95% quantiles, 84% highest density intervals, etc.
+  -   MCMC is a general purpose algorithm 
+  -   Take-away: our estimation procedure yields draws from the posterior distribution
+
+## Drawing samples
+
+::: columns
+::: column
+
+```{r}
+# generate draws from a standard normal distribution
+y <- rnorm(n = 1000, mean = 0, sd = 1) |> round(3)
+
+# show some draws
+head(y)
+
+# mean, SD, and quantiles
+mean(y) 
+sd(y)
+quantile(y, c(0.025, 0.975))
+
+# 95% is contained within 1.96 SDs of the mean
+qnorm(p = c(0.025, 0.975), mean = 0, sd = 1)
+```
+
+:::
+::: column
+
+```{r}
+# histogram of the draws vs. density of the distribution
+pacman::p_load(tidyverse, distributional, ggdist, ggeasy, patchwork)
+wrap_plots(
+  tibble(y = y) |> 
+    ggplot(aes(y)) + 
+    geom_histogram() + 
+    easy_remove_y_axis() + 
+    labs(title = "Draws of Normal(0, 1)"),
+  tibble(normal = dist_normal()) |> 
+    ggplot(aes(xdist = normal)) + 
+    stat_slab() + 
+    easy_remove_y_axis() + 
+    labs(title = "Density of Normal(0, 1)")
+)
+```
+
+:::
+:::
+
+## Building models in a Bayesian framework
+
+  -   Determine possible response distributions distributions for data
+  -   Determine how your research question can be modeled as function of parameters
+      -   Linear regression: $\mu$ in $y \sim \mathrm{Normal}(\mu, \sigma)$
+      -   Logistic regression: $\operatorname{logit}(\psi)$ in $y \sim \mathrm{Bernoulli}(\psi)$
+  -   For example, a linear regression with one predictor might look like this:
+
+::: fragment
+
+$$
+\begin{aligned}
+y_i &\sim \mathrm{Normal} (\mu_i, \sigma), \quad i \in 1:I \\
+\mu_i &= \mathbf{X}_i \cdot \boldsymbol{\beta}
+\end{aligned}
+$$
+
+:::
+
+  -   Frequentist model:
+
+::: fragment
+
+$$
+\begin{aligned}
+y_i &= \mathbf{X}_i \cdot \boldsymbol{\beta} + \epsilon_i, \quad i \in 1:I \\
+\epsilon_i &\sim \mathrm{Normal}(0, \sigma) 
+\end{aligned}
+$$
+
+:::
+  
+## Models as DAGs
+
+::: columns
+::: column
+
+  -   Express models as directed acyclic graphs (DAGs)
+  -   "Parent" nodes need prior distributions
+  -   Linear regression: vector of coefficients including intercept ($\boldsymbol{\beta}$) and SD ($\sigma$)
+  -   "Likelihood is the prior for the data" [@mcelreath2020]
+  
+:::
+::: {.column .fragment}
+
+```{r}
+#| fig-asp: 0.8
+
+pacman::p_load(dagitty, ggdag)
+dagify(mu ~ beta, 
+       mu ~ X, 
+       y ~ mu, 
+       y ~ sigma, 
+       outcome = "y") |> 
+  ggdag(text = F, node_size = 30) + 
+  geom_dag_text(parse = T, size = 10) +
+  theme_dag()
+```
+
+:::
+:::
+
+## Setting priors
+
+::: columns
+::: column
+
+  -   Priors should encode our domain expertise about parameters
+  -   Researchers often aim for priors without much influence (vague, uninformative, flat, etc.)
+  -   "Let the data speak for itself" through the likelihood
+  -   But what is a "flat prior"?
+  -   What's flat on one scale is highly informative on another
+  -   We can assess the influence of the prior through sensitivity analysis
+  
+:::
+::: {.column .fragment}
+
+```{r}
+inv_logit <- function(x) 1 / (1 + exp(-x))
+tibble(`logit(alpha)` = rnorm(1e4, 0, 10),
+       alpha = inv_logit(`logit(alpha)`)) |> 
+  pivot_longer(everything()) |> 
+  ggplot(aes(value)) + 
+  facet_wrap(~ name, scales = "free") + 
+  geom_histogram() + 
+  ggeasy::easy_remove_y_axis() + 
+  labs(x = "Prior")
+```
+
+:::
+:::
+
+::: fragment
+::: {.callout-note}
+Priors are important, but we will focus on them as we go instead of diving deep now.
+:::
+:::
+
+## Prior predictive checks
+
+  -   The implied prior on your response variable matters more than priors on individual parameters
+  -   Prior predictive checks simulate data from priors
+  -   Example: logistic regression with one predictor
+  
+::: fragment
+```{r}
+#| output-location: column
+#| fig-asp: 0.8
+
+# Normal(0, 3) priors on intercept and slope ("flat")
+N <- 1e3
+alpha <- rnorm(N, 0, 3)
+beta <- rnorm(N, 0, 3)
+x <- rnorm(N)  # standardised predictor
+y_flat <- plogis(alpha + beta * x)
+
+# Normal(0, 1) priors ("weakly informative")
+alpha <- rnorm(N, 0, 1)
+beta <- rnorm(N, 0, 1)
+y_weak <- inv_logit(alpha + beta * x)
+
+# plot
+tibble(y = c(y_flat, y_weak), 
+       prior = rep(c("flat", "weakly informative"), each = N)) |> 
+  ggplot(aes(y)) + 
+  facet_wrap(~ prior, ncol = 1,  scales = "free_x") + 
+  geom_histogram() + 
+  coord_cartesian(expand = F) + 
+  easy_remove_y_axis() + 
+  labs(x = "Prior predictive distribution")
+```
+:::
+
+# References
