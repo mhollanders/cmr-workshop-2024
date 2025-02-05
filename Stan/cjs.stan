@@ -1,10 +1,10 @@
 functions {
   /** 
-   * Return the natural logarithm of the product of the 
-   * elementwise exponentiation of a matrix and vector
+   * Return the natural logarithm of the product of the elementwise 
+   * exponentiation of a matrix and vector (log matrix multiplication)
    *
-   * @param A  First matrix
-   * @param B  Second vector
+   * @param A  Matrix
+   * @param B  Vector
    *
    * @return   log(exp(A) * exp(B))
    */
