@@ -88,7 +88,7 @@ model {
   // dummy individuals are uncertain throughout
   for (i in (I + 1):K) {
 
-    // can't transition from not yet entered to dead
+    // see https://github.com/stan-dev/math/issues/2494
     Omega[1:2, 2] = log_prod_exp(log_P_z[i, 1][1:2, 1:2], Omega[1:2, 1])
                     + log_P_y[i, 1][1:2, 1];
 
@@ -203,7 +203,7 @@ generated quantities {
   array[I + K] int alive;
   for (j in 2:J) {
     for (i in 1:(I + K)) {
-      alive[i] = z[i, j] == 1;
+      alive[i] = z[i, j] == 2;
     }
     N[j] = sum(alive);
   }
