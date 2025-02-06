@@ -1,13 +1,12 @@
 library(tidyverse)
 get_dh <- function(detections, 
                    dates, 
-                   date = "date",
+                   date = "date", 
                    individual = "individual", 
-                   survey = "survey", 
                    covariates = NULL) {
   # create survey column
   dates <- dates |> 
-    mutate(factor(date) |> as.numeric())
+    mutate(survey = factor(all_of(date)) |> as.numeric())
   
   # join datasets
   dat <- detections |> 
