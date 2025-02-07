@@ -24,24 +24,26 @@ data {
   int<lower=1> I, J, K;  // number of individuals, surveys, and augmented individuals
   array[I] int<lower=2, upper=J> f;  // first capture
   array[I] int<lower=f, upper=J> l;  // last capture
+  vector<lower=0>[J - 1] tau;  // time intervals between surveys
   array[I + K, J] int<lower=1, upper=2> y;   // detection history
 }
 
 parameters {
-  real<lower=0, upper=1> phi, p;
-  vector<lower=0, upper=1>[J - 1] gamma;
+  real<lower=0, upper=1> phi_a, p_a;  // survival and detection probabilities
+  vector<lower=0, upper=1>[J - 1] gamma;  // removal entry probabilities
 }
 
 model {
   // priors
   target += beta_lupdf(gamma | 1, 10);
-  target += beta_lupdf(phi | 1, 1);
-  target += beta_lupdf(p | 1, 1);
+  target += beta_lupdf(phi_a | 1, 1);
+  target += beta_lupdf(p_a | 1, 1);
   
   // pre-compute log probabilities
-  real log_phi = log(phi), log1m_phi = log1m(phi);
-  real log_p = log(p), log1m_p = log1m(p);
   vector[J - 1] log_gamma = log(gamma), log1m_gamma = log1m(gamma);
+  vector[J - 1] phi = pow(phi_a, tau);
+  vector[J - 1] log_phi = log(phi), log1m_phi = log1m(phi);
+  real log_p = log(p_a), log1m_p = log1m(p_a);
   
   // log TPMs (per individual and survey)
   array[I + K, J - 1] matrix[3, 3] log_P_z;
@@ -49,10 +51,10 @@ model {
   for (i in 1:(I + K)) {
     for (j in 1:(J - 1)) {
       log_P_z[i, j] = [[ log1m_gamma[j], log_gamma[j], negative_infinity() ],
-                       [ negative_infinity(), log_phi, log1m_phi ],
+                       [ negative_infinity(), log_phi[j], log1m_phi[j] ],
                        [ negative_infinity(), negative_infinity(), 0 ]]';
-      log_P_y[i, j] = [[ 0, negative_infinity() ], 
-                       [ log1m_p, log_p ], 
+      log_P_y[i, j] = [[ 0, negative_infinity() ],
+                       [ log1m_p, log_p ],
                        [ 0, negative_infinity() ]];
     }
   }
@@ -86,11 +88,12 @@ model {
   }
   
   // dummy individuals are uncertain throughout
-  for (i in (I + 1):K) {
+  for (i in (I + 1):(I + K)) {
 
     // see https://github.com/stan-dev/math/issues/2494
     Omega[1:2, 2] = log_prod_exp(log_P_z[i, 1][1:2, 1:2], Omega[1:2, 1])
                     + log_P_y[i, 1][1:2, 1];
+    Omega[3, 2] = negative_infinity();
 
     // subsequent surveys
     for (j in 3:J) {
@@ -107,15 +110,16 @@ generated quantities {
   array[J] int N = zeros_int_array(J);
   {
     // parameters
-    real log_phi = log(phi), log1m_phi = log1m(phi);
-    real log_p = log(p), log1m_p = log1m(p);
     vector[J - 1] log_gamma = log(gamma), log1m_gamma = log1m(gamma);
+    vector[J - 1] phi = pow(phi_a, tau);
+    vector[J - 1] log_phi = log(phi), log1m_phi = log1m(phi);
+    real log_p = log(p_a), log1m_p = log1m(p_a);
     array[I + K, J - 1] matrix[3, 3] log_P_z;
     array[I + K, J - 1] matrix[3, 2] log_P_y;
     for (i in 1:(I + K)) {
       for (j in 1:(J - 1)) {
         log_P_z[i, j] = [[ log1m_gamma[j], log_gamma[j], negative_infinity() ],
-                         [ negative_infinity(), log_phi, log1m_phi ],
+                         [ negative_infinity(), log_phi[j], log1m_phi[j] ],
                          [ negative_infinity(), negative_infinity(), 0 ]]';
         log_P_y[i, j] = [[ 0, negative_infinity() ],
                          [ log1m_p, log_p ],
@@ -182,7 +186,7 @@ generated quantities {
     }
     
     // dummy individuals
-    for (i in (I + 1):K) {
+    for (i in (I + 1):(I + K)) {
       for (j in 2:J) {
         for (a in 1:3) {
           lp = log_P_z[i, j - 1][a]' + best_lp[:, j - 1]
