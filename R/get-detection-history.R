@@ -42,7 +42,7 @@ get_dh <- function(detections,
   y <- matrix(0, I, J)
   for (i in 1:I) {
     dat_i <- filter(dat, as.numeric(individual) == i)
-    for (j in f[i]:J) {
+    for (j in f[i]:l[i]) {
       y[i, j] <- dat_i |> 
         filter(survey == j) |>
         nrow()
@@ -52,7 +52,7 @@ get_dh <- function(detections,
   # return Jolly-Seber data
   if (jolly_seber) {
     list(I = I,
-         J = J, 
+         J = J + 1, 
          K = K, 
          f = f + 1, 
          l = l + 1, 
