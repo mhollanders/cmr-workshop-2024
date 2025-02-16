@@ -40,8 +40,8 @@ data {
   int<lower=1> I, J, K_max;  // number of individuals, primaries, and max secondaries
   array[I] int<lower=1, upper=J> f;  // primary of first capture
   array[I] int<lower=f, upper=J> l;  // primary last capture
-  array[J] int<lower=1, upper=K_max> K;  // number of secondaries
-  vector<lower=0>[J] tau;  // time intervals between surveys
+  array[J] int<lower=1, upper=K_max> K;  // number of secondaries per primary
+  vector<lower=0>[J] tau;  // time intervals between primaries
   array[I, J, K_max] int<lower=1, upper=2> y;   // detection history
   int<lower=0> I_aug;  // number of augmented individuals
 }
