@@ -47,6 +47,9 @@ data {
 
 transformed data {
   int JS = I_aug > 0;  // Jolly-Seber indicator
+  tuple(real, vector[J]) gamma_prior;  // beta prior shapes for removal entry
+  gamma_prior.1 = 1.0 / J;
+  gamma_prior.2 = 2 - linspaced_vector(J, 1, J) / J;
 }
 
 parameters {
@@ -63,7 +66,7 @@ model {
   target += logistic_lupdf(l_phi_a | 0, 1);
   target += logistic_lupdf(l_p_a | 0, 1);
   if (JS) {
-    target += beta_lupdf(gamma | 1, J);
+    target += beta_lupdf(gamma | gamma_prior.1, gamma_prior.2);  // Dorazio 2020 prior
   }
   
   // pre-compute log probabilities
